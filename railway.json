@@ -1,4 +1,3 @@
-# Railway Configuration
 {
   "$schema": "https://railway.app/schema.json",
   "name": "10k-stock-analyzer",
