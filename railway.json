@@ -1,0 +1,72 @@
+# Railway Configuration
+{
+  "$schema": "https://railway.app/schema.json",
+  "name": "10k-stock-analyzer",
+  "description": "AI-powered SEC 10-K filing analyzer using LlamaIndex and OpenAI",
+  
+  "services": {
+    "api": {
+      "image": "railwayapp/nixpacks:latest",
+      "builder": "nixpacks",
+      "buildCommand": "pip install -r requirements.txt",
+      "startCommand": "python -m src.app",
+      "port": 8000,
+      "environment": {
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "healthCheck": {
+        "path": "/health",
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3
+      }
+    },
+    "postgres": {
+      "image": "postgres:15",
+      "variables": {
+        "POSTGRES_DB": "postgres",
+        "POSTGRES_USER": "postgres"
+      }
+    }
+  },
+  
+  "variables": {
+    "OPENAI_API_KEY": {
+      "description": "OpenAI API key for GPT-4 access",
+      "required": true
+    },
+    "SUPABASE_HOST": {
+      "description": "Supabase PostgreSQL host",
+      "required": true
+    },
+    "SUPABASE_PASSWORD": {
+      "description": "Supabase PostgreSQL password",
+      "required": true
+    },
+    "SUPABASE_USER": {
+      "value": "postgres",
+      "description": "Supabase PostgreSQL user"
+    },
+    "SUPABASE_PORT": {
+      "value": "5432",
+      "description": "Supabase PostgreSQL port"
+    },
+    "SUPABASE_DB": {
+      "value": "postgres",
+      "description": "Supabase PostgreSQL database name"
+    },
+    "LANGFUSE_PUBLIC_KEY": {
+      "description": "LangFuse public key (optional)",
+      "required": false
+    },
+    "LANGFUSE_SECRET_KEY": {
+      "description": "LangFuse secret key (optional)",
+      "required": false
+    },
+    "LANGFUSE_HOST": {
+      "description": "LangFuse host URL (optional)",
+      "required": false
+    }
+  }
+}
