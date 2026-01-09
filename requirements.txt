@@ -1,0 +1,30 @@
+# Core LlamaIndex
+llama-index==0.10.68
+
+# Vector stores (compatible with 0.10.68)
+llama-index-vector-stores-postgres==0.1.14
+
+# LLMs and Embeddings (compatible with 0.10.68)
+llama-index-llms-openai==0.1.29
+llama-index-embeddings-openai==0.1.11
+
+# Observability
+langfuse==2.53.3
+llama-index-callbacks-langfuse==0.1.6
+
+# Database
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.36
+
+# SEC Data
+sec-edgar-downloader==5.0.3
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# UI
+streamlit==1.39.0
+
+# Utils
+python-dotenv==1.0.1
+pandas==2.2.3
+requests==2.32.3
