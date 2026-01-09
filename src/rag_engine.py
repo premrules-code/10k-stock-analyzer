@@ -1,13 +1,7 @@
-""
-ALTERNATIVE SOLUTION: Separate vector stores per ticker
-
-Instead of one big vector store with metadata filtering,
-create separate tables for each company.
-"""
-
 import sys
 from pathlib import Path
 
+# Ensure project root is on sys.path
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -36,6 +30,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import configuration
 from src.config.openai import (
     OPENAI_MODEL,
     OPENAI_EMBEDDING_MODEL,
@@ -55,6 +50,7 @@ class StockAnalyzer:
         Settings.chunk_size = CHUNK_SIZE
         Settings.chunk_overlap = CHUNK_OVERLAP
         
+        # Setup LangFuse observability
         self._setup_observability()
         
         self.downloader = SECDownloader()
@@ -151,7 +147,7 @@ class StockAnalyzer:
             self._create_query_engine()
             
             self.current_ticker = ticker
-            logger.info(f"✅ Loaded {ticker} index successfully from dedicated table!")
+            logger.info(f"✅ Loaded {ticker} index successfully from table: chunks_{ticker.lower()}")
             return True
             
         except Exception as e:
@@ -253,7 +249,7 @@ class StockAnalyzer:
         vector_store = self._get_vector_store_for_ticker(ticker)
         
         # Step 5: Build vector index in ticker-specific table
-        logger.info(f"🔨 Building vector index for {ticker} in dedicated table...")
+        logger.info(f"🔨 Building vector index for {ticker} in table: chunks_{ticker.lower()}")
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
         
         self.index = VectorStoreIndex.from_documents(
@@ -276,7 +272,7 @@ class StockAnalyzer:
             return None
         
         logger.info(f"\n💬 Q: {question}")
-        logger.info(f"🎯 Querying {self.current_ticker}'s dedicated vector store")
+        logger.info(f"🎯 Querying {self.current_ticker}'s dedicated vector store (table: chunks_{self.current_ticker.lower()})")
         
         response = self.query_engine.query(question)
         
@@ -289,7 +285,7 @@ class StockAnalyzer:
             
             source_info = {
                 "source_number": i,
-                "ticker": node.metadata.get("ticker", "Unknown"),
+                "ticker": node.metadata.get("ticker", self.current_ticker),  # Fallback to current ticker
                 "fiscal_year": node.metadata.get("fiscal_year", "Unknown"),
                 "filing_type": node.metadata.get("filing_type", "10-K"),
                 "accession": node.metadata.get("accession", "N/A"),
@@ -305,6 +301,13 @@ class StockAnalyzer:
         logger.info(f"📝 A: {answer[:200]}...")
         logger.info(f"📚 Sources: {len(sources)} | Citations: {len(citations_found)}")
         
+        # Verify all sources are from the correct ticker
+        mismatched_sources = [s for s in sources if s['ticker'] != self.current_ticker]
+        if mismatched_sources:
+            logger.warning(f"⚠️ Found {len(mismatched_sources)} sources from other companies!")
+        else:
+            logger.info(f"✅ All sources verified from {self.current_ticker}")
+        
         return {
             "answer": answer,
             "sources": sources,
@@ -315,9 +318,10 @@ class StockAnalyzer:
     
     def get_analyzed_companies(self):
         """Get list of companies stored in database"""
-        return self.database.get_analyzed_companies()
+        return self.database.get_companies()
 
 
+# Test the system
 if __name__ == "__main__":
     analyzer = StockAnalyzer()
     
@@ -340,5 +344,8 @@ if __name__ == "__main__":
                 
                 result = analyzer.ask(q)
                 if result:
-                    print(f"\n{result['answer']}\n")
-                    print(f"Citations: {result['num_citations']}, Sources: {result['num_sources']}")
+                    print(f"\n📝 ANSWER:\n{result['answer']}\n")
+                    print(f"📊 STATS:")
+                    print(f"  Citations: {result['num_citations']}")
+                    print(f"  Sources: {result['num_sources']}")
+                    print(f"  All from {ticker}: {'✅ Yes' if all(s['ticker'] == ticker for s in result['sources']) else '❌ No'}")

@@ -50,20 +50,32 @@ st.markdown("""
         color: #ff9800;
         font-weight: bold;
     }
+    .ticker-badge {
+        background-color: #667eea;
+        color: white;
+        padding: 5px 15px;
+        border-radius: 20px;
+        font-weight: bold;
+        display: inline-block;
+        margin: 5px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize analyzer (NOT cached - we need to reload for different companies)
+# Initialize analyzer in session state (NOT cached)
 if "analyzer" not in st.session_state:
     st.session_state.analyzer = StockAnalyzer()
-    st.session_state.analyzer.connect_to_supabase()
     st.session_state.current_ticker = None
 
 analyzer = st.session_state.analyzer
 
 # Header
 st.markdown('<p class="main-header">📊 10-K Stock Analysis AI</p>', unsafe_allow_html=True)
-st.markdown("**Powered by Supabase + OpenAI GPT-4 | With Detailed Citations**")
+st.markdown("**Powered by Supabase + OpenAI GPT-4 | Separate Tables Per Company**")
+
+if st.session_state.current_ticker:
+    st.markdown(f'<div class="ticker-badge">Currently Analyzing: {st.session_state.current_ticker}</div>', 
+                unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
@@ -79,23 +91,28 @@ with st.sidebar:
         selected = st.selectbox(
             "Query Company",
             options=[c["ticker"] for c in companies],
-            index=0,
+            index=0 if not st.session_state.current_ticker else 
+                  ([c["ticker"] for c in companies].index(st.session_state.current_ticker) 
+                   if st.session_state.current_ticker in [c["ticker"] for c in companies] else 0),
             key="company_selector"
         )
         
-        # CRITICAL FIX: Load the selected company's index
+        # Load the selected company's index
         if selected and selected != st.session_state.current_ticker:
-            with st.spinner(f"Loading {selected} index..."):
+            with st.spinner(f"Loading {selected} from table chunks_{selected.lower()}..."):
                 try:
-                    # Load existing index from Supabase for this company
                     success = analyzer.load_company_index(selected)
                     if success:
                         st.session_state.current_ticker = selected
                         st.success(f"✅ Loaded {selected}")
+                        st.rerun()
                     else:
                         st.error(f"❌ Failed to load {selected}")
                 except Exception as e:
                     st.error(f"Error loading company: {str(e)}")
+                    import traceback
+                    with st.expander("🐛 Debug Info"):
+                        st.code(traceback.format_exc())
     else:
         st.info("No companies analyzed yet")
     
@@ -129,6 +146,12 @@ with st.sidebar:
     st.markdown("---")
     st.caption("**💡 Popular Tickers:**")
     st.caption("AAPL • MSFT • GOOGL • TSLA • AMZN • META • NVDA")
+    
+    st.markdown("---")
+    st.caption("**🔧 Architecture:**")
+    st.caption(f"Using separate tables per company")
+    if st.session_state.current_ticker:
+        st.caption(f"Current table: chunks_{st.session_state.current_ticker.lower()}")
 
 # Main content
 if st.session_state.current_ticker:
@@ -137,12 +160,12 @@ if st.session_state.current_ticker:
     st.header(f"💬 Ask Questions About {ticker}")
     
     # Check if query engine is ready
-    if not analyzer.query_engine:
+    if not analyzer.query_engine or analyzer.current_ticker != ticker:
         st.error("⚠️ Query engine not ready. Please reselect the company or analyze a new one.")
         if st.button("🔄 Reload Company"):
             st.rerun()
     else:
-        with st.expander("📌 Example Questions"):
+        with st.expander("📌 Example Questions", expanded=False):
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("""
@@ -173,7 +196,7 @@ if st.session_state.current_ticker:
             ask_button = st.button("🔍 Ask Question", type="primary", use_container_width=True)
         
         if ask_button and question:
-            with st.spinner("🤔 Analyzing 10-K filing..."):
+            with st.spinner(f"🤔 Analyzing {ticker}'s 10-K filing..."):
                 try:
                     result = analyzer.ask(question)
                     
@@ -185,7 +208,6 @@ if st.session_state.current_ticker:
                         
                         # Highlight citations with custom styling
                         def highlight_citations(text):
-                            # Replace [Source X] with styled version
                             pattern = r'\[Source (\d+)\]'
                             highlighted = re.sub(
                                 pattern,
@@ -199,7 +221,7 @@ if st.session_state.current_ticker:
                         
                         # Citation quality metrics
                         st.markdown("---")
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         
                         with col1:
                             citations_class = "metric-good" if result["num_citations"] > 0 else "metric-warning"
@@ -214,24 +236,36 @@ if st.session_state.current_ticker:
                             quality = "✅ Well-Cited" if result["has_proper_citations"] else "⚠️ No Citations"
                             st.markdown(f"**Quality:** {quality}")
                         
+                        with col4:
+                            # Verify all sources are from correct ticker
+                            correct_ticker = all(s['ticker'] == ticker for s in result['sources'])
+                            ticker_status = "✅ Verified" if correct_ticker else "⚠️ Mixed"
+                            st.markdown(f"**Ticker:** {ticker_status}")
+                        
                         # Display detailed sources
                         if result["sources"]:
                             st.markdown("---")
                             st.markdown("### 📚 Source Details")
                             
                             for source in result["sources"]:
+                                ticker_emoji = "✅" if source['ticker'] == ticker else "⚠️"
+                                
                                 with st.expander(
-                                    f"📄 Source {source['source_number']}: "
+                                    f"{ticker_emoji} Source {source['source_number']}: "
                                     f"{source['ticker']} {source['filing_type']} - "
                                     f"FY{source['fiscal_year']} "
                                     f"(Relevance: {source['relevance_score']})",
                                     expanded=False
                                 ):
-                                    st.markdown(f"**Company:** {source['ticker']}")
-                                    st.markdown(f"**Filing Type:** {source['filing_type']}")
-                                    st.markdown(f"**Fiscal Year:** {source['fiscal_year']}")
-                                    st.markdown(f"**Relevance Score:** {source['relevance_score']}")
-                                    st.markdown(f"**Accession Number:** {source['accession']}")
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        st.markdown(f"**Company:** {source['ticker']}")
+                                        st.markdown(f"**Filing:** {source['filing_type']}")
+                                    with col2:
+                                        st.markdown(f"**Year:** {source['fiscal_year']}")
+                                        st.markdown(f"**Score:** {source['relevance_score']}")
+                                    with col3:
+                                        st.markdown(f"**Accession:** {source['accession'][:20]}...")
                                     
                                     st.markdown("**Text Excerpt:**")
                                     st.text_area(
@@ -250,7 +284,8 @@ if st.session_state.current_ticker:
                             "ticker": ticker,
                             "question": question,
                             "answer": answer_text[:200] + "...",
-                            "citations": result["num_citations"]
+                            "citations": result["num_citations"],
+                            "verified": all(s['ticker'] == ticker for s in result['sources'])
                         })
                 
                 except Exception as e:
@@ -264,11 +299,22 @@ if st.session_state.current_ticker:
             st.markdown("---")
             st.subheader("📜 Recent Questions")
             
-            for i, qa in enumerate(reversed(st.session_state["qa_history"][-5:]), 1):
-                with st.expander(f"{qa['ticker']}: {qa['question'][:60]}... ({qa['citations']} citations)"):
-                    st.markdown(f"**Q:** {qa['question']}")
-                    st.markdown(f"**A:** {qa['answer']}")
-                    st.caption(f"Citations: {qa['citations']}")
+            # Filter history for current ticker
+            ticker_history = [qa for qa in st.session_state["qa_history"] if qa['ticker'] == ticker]
+            
+            if ticker_history:
+                for i, qa in enumerate(reversed(ticker_history[-5:]), 1):
+                    verified_emoji = "✅" if qa.get('verified', False) else "⚠️"
+                    with st.expander(
+                        f"{verified_emoji} {qa['ticker']}: {qa['question'][:60]}... "
+                        f"({qa['citations']} citations)"
+                    ):
+                        st.markdown(f"**Q:** {qa['question']}")
+                        st.markdown(f"**A:** {qa['answer']}")
+                        st.caption(f"Citations: {qa['citations']} | "
+                                 f"Verified: {'Yes' if qa.get('verified', False) else 'No'}")
+            else:
+                st.info(f"No questions asked about {ticker} yet")
 
 else:
     # Welcome screen
@@ -285,8 +331,8 @@ else:
         st.write("Every fact includes source citations")
     
     with col3:
-        st.markdown("### ☁️ Cloud Database")
-        st.write("Supabase Postgres with pgvector")
+        st.markdown("### 🔒 Isolated")
+        st.write("Separate tables prevent data mixing")
     
     st.markdown("---")
     st.subheader("🔄 How It Works")
@@ -303,11 +349,26 @@ else:
     
     with col3:
         st.markdown("**3️⃣ Store**")
-        st.caption("Save to Supabase pgvector")
+        st.caption("Save to company-specific table")
     
     with col4:
         st.markdown("**4️⃣ Query**")
         st.caption("AI answers with citations")
+    
+    st.markdown("---")
+    st.subheader("🏗️ Architecture")
+    st.markdown("""
+    This app uses **separate database tables** for each company:
+    - `chunks_aapl` - Apple's vectors
+    - `chunks_nvda` - Nvidia's vectors
+    - `chunks_msft` - Microsoft's vectors
+    
+    **Benefits:**
+    - ✅ 100% data isolation
+    - ✅ No cross-contamination possible
+    - ✅ Fast, targeted queries
+    - ✅ Easy to delete/update individual companies
+    """)
 
 st.markdown("---")
-st.caption("Built with ❤️ using LlamaIndex • OpenAI • Supabase")
+st.caption("Built with ❤️ using LlamaIndex • OpenAI • Supabase • Separate Tables Architecture")
