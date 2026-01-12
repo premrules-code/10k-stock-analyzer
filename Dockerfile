@@ -1,39 +1,42 @@
-# Use Python 3.11 slim image
+# ============================================================================
+# Simple Dockerfile for Railway/Local Testing
+# ============================================================================
 FROM python:3.11-slim
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8080
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Install minimal system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements first for better caching
-COPY requirements.txt .
-
 # Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy ALL application code (INCLUDING app.py)
 COPY . .
 
-# Create data directory for downloads
-RUN mkdir -p data
+# Verify app.py exists (debugging step)
+RUN ls -la app.py || echo "ERROR: app.py not found!"
 
 # Expose port
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK CMD curl --fail http://localhost:8080/_stcore/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8080/_stcore/health || exit 1
 
 # Run Streamlit
-CMD streamlit run src/app.py \
-    --server.port=8080 \
-    --server.address=0.0.0.0 \
-    --server.headless=true \
-    --browser.serverAddress=0.0.0.0 \
-    --browser.gatherUsageStats=false \
-    --server.enableCORS=false \
-    --server.enableXsrfProtection=false
+CMD ["streamlit", "run", "app.py", \
+     "--server.address", "0.0.0.0", \
+     "--server.port", "8080", \
+     "--server.headless", "true", \
+     "--browser.gatherUsageStats", "false"]

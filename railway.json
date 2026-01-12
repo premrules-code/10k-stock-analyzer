@@ -8,8 +8,8 @@
       "image": "railwayapp/nixpacks:latest",
       "builder": "nixpacks",
       "buildCommand": "pip install -r requirements.txt",
-      "startCommand": "python -m src.app",
-      "port": 8000,
+      "startCommand": "streamlit run app.py --server.port 8080 --server.address 0.0.0.0",
+      "port": 8080,
       "environment": {
         "PYTHONUNBUFFERED": "1",
         "PYTHONDONTWRITEBYTECODE": "1"

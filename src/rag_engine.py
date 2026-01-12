@@ -1,351 +1,353 @@
-import sys
-from pathlib import Path
+"""
+Multi-Company Stock Analyzer with RAG and LangFuse Observability
+"""
 
-# Ensure project root is on sys.path
-project_root = Path(__file__).resolve().parents[1]
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
-
-from llama_index.core import (
-    VectorStoreIndex, 
-    Document, 
-    Settings, 
-    StorageContext,
-    PromptTemplate
-)
-from llama_index.vector_stores.postgres import PGVectorStore
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import VectorStoreIndex, Settings, StorageContext
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import Document
+from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 from llama_index.core.callbacks import CallbackManager
-
-from src.downloader import SECDownloader
-from src.database import Database
-from dotenv import load_dotenv
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.postgres import PGVectorStore
+from langfuse.decorators import observe, langfuse_context
+from typing import Dict, List, Optional
 import os
+from dotenv import load_dotenv
 import logging
-from sqlalchemy import create_engine, text
-import re
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Import configuration
-from src.config.openai import (
-    OPENAI_MODEL,
-    OPENAI_EMBEDDING_MODEL,
-    OPENAI_TEMPERATURE,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
-)
 
-
-class StockAnalyzer:
-    """AI-powered 10-K analysis engine with SEPARATE vector stores per company"""
+class MultiCompanyStockAnalyzer:
+    """
+    RAG-based analyzer for multiple companies' 10-K filings
+    Uses a single vector table with metadata filtering
+    """
     
     def __init__(self):
-        # Configure AI models
-        Settings.llm = OpenAI(model=OPENAI_MODEL, temperature=OPENAI_TEMPERATURE)
-        Settings.embed_model = OpenAIEmbedding(model=OPENAI_EMBEDDING_MODEL)
-        Settings.chunk_size = CHUNK_SIZE
-        Settings.chunk_overlap = CHUNK_OVERLAP
+        """Initialize the analyzer with vector store and LLM"""
         
-        # Setup LangFuse observability
-        self._setup_observability()
+        logger.info("\n" + "="*70)
+        logger.info("🔧 INITIALIZING RAG ENGINE")
+        logger.info("="*70 + "\n")
         
-        self.downloader = SECDownloader()
-        self.database = Database()
-        self.vector_stores = {}  # Cache of vector stores by ticker
-        self.index = None
-        self.query_engine = None
-        self.current_ticker = None
+        # 1. Database connection
+        logger.info("1️⃣  Connecting to vector database...")
+        database_url = os.getenv("DATABASE_URL")
         
-        # Database connection params
-        self.db_params = {
-            "database": os.getenv("SUPABASE_DB", "postgres"),
-            "host": os.getenv("SUPABASE_HOST"),
-            "password": os.getenv("SUPABASE_PASSWORD"),
-            "port": int(os.getenv("SUPABASE_PORT", 5432)),
-            "user": os.getenv("SUPABASE_USER", "postgres"),
-        }
-    
-    def _setup_observability(self):
-        """Setup LangFuse for cost tracking"""
-        if not all([
-            os.getenv("LANGFUSE_PUBLIC_KEY"),
-            os.getenv("LANGFUSE_SECRET_KEY"),
-            os.getenv("LANGFUSE_HOST")
-        ]):
-            logger.info("ℹ️ LangFuse not configured, skipping observability")
-            return
+        if not database_url:
+            raise ValueError("DATABASE_URL not found in environment")
         
-        try:
-            from llama_index.core.callbacks.langfuse import LangfuseCallbackHandler
-            
-            langfuse_handler = LangfuseCallbackHandler(
-                public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-                secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-                host=os.getenv("LANGFUSE_HOST")
-            )
-            Settings.callback_manager = CallbackManager([langfuse_handler])
-            logger.info("🔍 LangFuse observability enabled")
-        except ImportError:
-            logger.warning("⚠️ LangFuse package not available")
-        except Exception as e:
-            logger.warning(f"⚠️ LangFuse setup failed: {e}")
-    
-    def _get_vector_store_for_ticker(self, ticker: str):
-        """Get or create a vector store for a specific ticker"""
-        # Use ticker-specific table name
-        table_name = f"chunks_{ticker.lower()}"
+        # Parse connection details
+        from urllib.parse import urlparse
+        parsed = urlparse(database_url)
         
-        if ticker not in self.vector_stores:
-            logger.info(f"🔌 Creating vector store for {ticker} (table: {table_name})")
-            
-            self.vector_stores[ticker] = PGVectorStore.from_params(
-                **self.db_params,
-                table_name=table_name,
-                embed_dim=1536
-            )
+        self.vector_store = PGVectorStore.from_params(
+            database=parsed.path[1:],
+            host=parsed.hostname,
+            password=parsed.password,
+            port=parsed.port or 5432,
+            user=parsed.username,
+            table_name="chunks_all_companies",
+            embed_dim=1536,
+        )
         
-        return self.vector_stores[ticker]
-    
-    def load_company_index(self, ticker: str):
-        """
-        Load an existing company's index from its dedicated vector store
-        """
-        logger.info(f"📂 Loading index for {ticker}...")
+        logger.info("   ✅ Vector store connected")
+        
+        # 2. OpenAI setup
+        logger.info("\n2️⃣  Setting up OpenAI...")
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment")
+        
+        self.embed_model = OpenAIEmbedding(
+            model="text-embedding-3-small",
+            api_key=openai_api_key,
+            embed_batch_size=10  # Reduce batch size to avoid rate limits
+        )
+        
+        self.llm = OpenAI(
+            model="gpt-4",
+            temperature=0.1,
+            api_key=openai_api_key
+        )
+        
+        logger.info("   ✅ OpenAI models initialized")
+        
+        # 3. LangFuse observability (optional)
+        logger.info("\n3️⃣  Setting up LangFuse observability...")
+        self.langfuse_handler = None
         
         try:
-            # Get company-specific vector store
-            vector_store = self._get_vector_store_for_ticker(ticker)
+            langfuse_public = os.getenv("LANGFUSE_PUBLIC_KEY")
+            langfuse_secret = os.getenv("LANGFUSE_SECRET_KEY")
+            langfuse_host = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
             
-            # Verify company exists in database
-            with self.database.engine.connect() as conn:
-                result = conn.execute(
-                    text("SELECT id FROM companies WHERE ticker = :ticker"),
-                    {"ticker": ticker}
-                )
-                company_data = result.fetchone()
+            if langfuse_public and langfuse_secret:
+                # Try new import first
+                try:
+                    from langfuse.llama_index import LlamaIndexCallbackHandler
+                    
+                    self.langfuse_handler = LlamaIndexCallbackHandler(
+                        public_key=langfuse_public,
+                        secret_key=langfuse_secret,
+                        host=langfuse_host
+                    )
+                    logger.info(f"   ✅ LangFuse enabled: {langfuse_host}")
                 
-                if not company_data:
-                    logger.error(f"❌ Company {ticker} not found in database")
-                    return False
-            
-            # Create storage context with ticker-specific vector store
+                except ImportError:
+                    logger.warning("   ⚠️  LangFuse LlamaIndex integration not available")
+                    logger.info("   ℹ️  Install with: pip install langfuse")
+            else:
+                logger.info("   ℹ️  LangFuse disabled (no API keys)")
+        
+        except Exception as e:
+            logger.warning(f"   ⚠️  LangFuse setup failed: {str(e)}")
+            logger.info("   ℹ️  Continuing without observability...")
+        
+        # 4. Configure LlamaIndex Settings
+        logger.info("\n4️⃣  Configuring LlamaIndex settings...")
+        Settings.embed_model = self.embed_model
+        Settings.llm = self.llm
+        Settings.chunk_size = 512
+        Settings.chunk_overlap = 50
+        
+        if self.langfuse_handler:
+            Settings.callback_manager = CallbackManager([self.langfuse_handler])
+            logger.info("   ✅ LangFuse callback registered")
+        
+        logger.info("   ✅ Settings configured")
+        
+        # 5. Load or create index
+        logger.info("\n5️⃣  Loading vector index...")
+        self.index = self.load_index()
+        logger.info("   ✅ Index ready")
+        
+        logger.info("\n" + "="*70)
+        logger.info("✅ RAG ENGINE READY")
+        logger.info("="*70 + "\n")
+    
+    def load_index(self) -> VectorStoreIndex:
+        """Load existing index from vector store or create new one"""
+        
+        try:
             storage_context = StorageContext.from_defaults(
-                vector_store=vector_store
+                vector_store=self.vector_store
             )
             
-            # Load index from vector store
-            self.index = VectorStoreIndex.from_vector_store(
-                vector_store,
+            index = VectorStoreIndex.from_vector_store(
+                vector_store=self.vector_store,
                 storage_context=storage_context
             )
             
-            # Create query engine (no filtering needed - table only has this ticker's data)
-            self._create_query_engine()
-            
-            self.current_ticker = ticker
-            logger.info(f"✅ Loaded {ticker} index successfully from table: chunks_{ticker.lower()}")
-            return True
-            
+            logger.info("   ✅ Loaded existing index")
+            return index
+        
         except Exception as e:
-            logger.error(f"❌ Failed to load {ticker}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _create_query_engine(self):
-        """Create query engine with detailed citation prompt"""
-        citation_qa_template = PromptTemplate(
-            "You are a financial analyst examining SEC 10-K filings. "
-            "You must provide detailed, well-cited answers.\n\n"
+            logger.info(f"   ℹ️  Creating new index")
             
-            "CONTEXT INFORMATION:\n"
-            "Below are relevant excerpts from the 10-K filing. "
-            "Each excerpt is numbered as [Source X].\n"
-            "---------------------\n"
-            "{context_str}\n"
-            "---------------------\n\n"
-            
-            "CITATION REQUIREMENTS (CRITICAL - YOU MUST FOLLOW THESE):\n"
-            "1. EVERY factual claim, number, or statement MUST include a citation\n"
-            "2. Use the format [Source X] immediately after each fact\n"
-            "3. If combining information from multiple sources, cite all: [Source 1, Source 2]\n"
-            "4. Direct quotes MUST be in quotation marks with citation: \"exact text\" [Source X]\n"
-            "5. NEVER make claims without citing the source\n"
-            "6. If information is not in the context, explicitly state: "
-            "'This information is not available in the provided 10-K filing.'\n\n"
-            
-            "ANSWER QUALITY REQUIREMENTS:\n"
-            "- Be specific: include exact numbers, percentages, and dates\n"
-            "- Be comprehensive: address all parts of the question\n"
-            "- Be accurate: only use information from the provided context\n"
-            "- Be clear: write in complete sentences with proper structure\n\n"
-            
-            "EXAMPLE FORMAT:\n"
-            "Apple's total net sales were $383.3 billion for fiscal year 2023 [Source 1], "
-            "representing a 3% decrease from $394.3 billion in fiscal 2022 [Source 2]. "
-            "The decline was primarily attributed to lower iPhone sales in international markets "
-            "[Source 1].\n\n"
-            
-            "Question: {query_str}\n\n"
-            
-            "Provide a detailed, well-structured answer with complete citations:"
-        )
-        
-        self.query_engine = self.index.as_query_engine(
-            similarity_top_k=5,
-            response_mode="compact",
-            text_qa_template=citation_qa_template
-        )
-        
-        logger.info("✅ Query engine created with citation support")
-    
-    def analyze_company(self, ticker: str, num_filings: int = 1):
-        """Download and analyze a company's 10-K with dedicated vector store"""
-        logger.info(f"\n{'='*60}")
-        logger.info(f"📊 ANALYZING {ticker}")
-        logger.info('='*60)
-        
-        # Step 1: Download 10-K
-        filings = self.downloader.download_10k(ticker, num_filings=num_filings)
-        if not filings:
-            logger.error(f"❌ No filings found for {ticker}")
-            return False
-        
-        # Step 2: Store company info
-        company_id = self.database.add_company(ticker)
-        
-        # Step 3: Process each filing
-        documents = []
-        for filing in filings:
-            filing_id = self.database.add_filing(company_id, filing)
-            
-            text = self.downloader.extract_text(filing["file_path"])
-            if not text:
-                continue
-            
-            # Create document with enriched metadata
-            doc = Document(
-                text=text,
-                metadata={
-                    "ticker": ticker,
-                    "filing_id": filing_id,
-                    "fiscal_year": filing["fiscal_year"],
-                    "accession": filing["accession"],
-                    "filing_type": "10-K",
-                    "source": f"{ticker} 10-K FY{filing['fiscal_year']}"
-                }
+            storage_context = StorageContext.from_defaults(
+                vector_store=self.vector_store
             )
-            documents.append(doc)
+            
+            index = VectorStoreIndex(
+                nodes=[],
+                storage_context=storage_context
+            )
+            
+            return index
+    
+    @observe(name="rag_index_company")
+    def analyze_company(
+        self,
+        ticker: str,
+        text: str,
+        metadata: Dict
+    ) -> None:
+        """
+        Add company filing to RAG index
         
-        if not documents:
-            logger.error("❌ No documents to process")
-            return False
+        Args:
+            ticker: Stock ticker symbol
+            text: Full filing text
+            metadata: Company and filing metadata
+        """
         
-        # Step 4: Get ticker-specific vector store
-        vector_store = self._get_vector_store_for_ticker(ticker)
-        
-        # Step 5: Build vector index in ticker-specific table
-        logger.info(f"🔨 Building vector index for {ticker} in table: chunks_{ticker.lower()}")
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        
-        self.index = VectorStoreIndex.from_documents(
-            documents,
-            storage_context=storage_context,
-            show_progress=True
+        langfuse_context.update_current_observation(
+            metadata={
+                "ticker": ticker,
+                "text_length": len(text),
+                "metadata_keys": list(metadata.keys())
+            }
         )
         
-        # Step 6: Create query engine
-        self._create_query_engine()
+        logger.info(f"\n📊 Adding {ticker} to RAG index...")
         
-        self.current_ticker = ticker
-        logger.info(f"✅ {ticker} ready for questions with citation support!")
-        return True
+        # Ensure ticker is in metadata
+        metadata["ticker"] = ticker
+        
+        # Convert all metadata values to strings (required for filtering)
+        for key, value in metadata.items():
+            if value is not None:
+                metadata[key] = str(value)
+        
+        # Parse text into chunks
+        parser = SentenceSplitter(
+            chunk_size=512,
+            chunk_overlap=50
+        )
+        
+        document = Document(
+            text=text,
+            metadata=metadata
+        )
+        
+        nodes = parser.get_nodes_from_documents([document])
+        
+        logger.info(f"   • Created {len(nodes)} text chunks")
+        logger.info(f"   • Metadata: {list(metadata.keys())}")
+        
+        # Insert into index (embeddings tracked by LangFuse automatically)
+        self.index.insert_nodes(nodes)
+        
+        logger.info(f"   ✅ {ticker} added to RAG index ({len(nodes)} chunks)\n")
+        
+        langfuse_context.update_current_observation(
+            output={"num_chunks": len(nodes)},
+            metadata={"success": True}
+        )
     
-    def ask(self, question: str):
-        """Ask a question about the 10-K and get a cited answer"""
-        if not self.query_engine:
-            logger.error("❌ No company loaded! Please select or analyze a company first.")
-            return None
+    @observe(name="rag_vector_search")
+    def ask(
+        self,
+        question: str,
+        ticker: Optional[str] = None,
+        fiscal_year: Optional[int] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None
+    ) -> Dict:
+        """
+        Ask a question with vector search - automatically tracked by LangFuse
         
-        logger.info(f"\n💬 Q: {question}")
-        logger.info(f"🎯 Querying {self.current_ticker}'s dedicated vector store (table: chunks_{self.current_ticker.lower()})")
+        Args:
+            question: User question
+            ticker: Filter by ticker (optional)
+            fiscal_year: Filter by year (optional)
+            temperature: LLM temperature
+            max_tokens: Max response tokens
         
-        response = self.query_engine.query(question)
+        Returns:
+            Dictionary with answer, sources, and metadata
+        """
         
-        answer = str(response)
-        
-        # Extract detailed source information
-        sources = []
-        for i, node in enumerate(response.source_nodes, 1):
-            source_text = node.text if hasattr(node, 'text') else node.node.text
-            
-            source_info = {
-                "source_number": i,
-                "ticker": node.metadata.get("ticker", self.current_ticker),  # Fallback to current ticker
-                "fiscal_year": node.metadata.get("fiscal_year", "Unknown"),
-                "filing_type": node.metadata.get("filing_type", "10-K"),
-                "accession": node.metadata.get("accession", "N/A"),
-                "relevance_score": round(node.score, 3) if hasattr(node, 'score') else None,
-                "text_excerpt": source_text[:300] + "..." if len(source_text) > 300 else source_text,
-                "full_text": source_text
+        # Set metadata for observability
+        langfuse_context.update_current_observation(
+            metadata={
+                "question_length": len(question),
+                "ticker": ticker,
+                "fiscal_year": fiscal_year,
+                "temperature": temperature
             }
-            sources.append(source_info)
+        )
         
-        # Count citations
-        citations_found = re.findall(r'\[Source \d+\]', answer)
+        logger.info(f"\n🔍 RAG Query: '{question[:50]}...'")
+        logger.info(f"   Filters: ticker={ticker}, year={fiscal_year}")
         
-        logger.info(f"📝 A: {answer[:200]}...")
-        logger.info(f"📚 Sources: {len(sources)} | Citations: {len(citations_found)}")
+        # Build metadata filters
+        metadata_filters = None
+        filters_applied = {}
         
-        # Verify all sources are from the correct ticker
-        mismatched_sources = [s for s in sources if s['ticker'] != self.current_ticker]
-        if mismatched_sources:
-            logger.warning(f"⚠️ Found {len(mismatched_sources)} sources from other companies!")
+        if ticker or fiscal_year:
+            filter_list = []
+            
+            if ticker:
+                filter_list.append(ExactMatchFilter(key="ticker", value=ticker))
+                filters_applied["ticker"] = ticker
+            
+            if fiscal_year:
+                # Convert to string for filtering
+                filter_list.append(ExactMatchFilter(key="fiscal_year", value=str(fiscal_year)))
+                filters_applied["fiscal_year"] = fiscal_year
+            
+            metadata_filters = MetadataFilters(filters=filter_list)
+            logger.info(f"   ✅ Applied filters: {filters_applied}")
         else:
-            logger.info(f"✅ All sources verified from {self.current_ticker}")
+            logger.info("   ℹ️  No filters applied (searching all documents)")
         
-        return {
-            "answer": answer,
-            "sources": sources,
-            "num_sources": len(sources),
-            "num_citations": len(citations_found),
-            "has_proper_citations": len(citations_found) > 0
-        }
-    
-    def get_analyzed_companies(self):
-        """Get list of companies stored in database"""
-        return self.database.get_companies()
-
-
-# Test the system
-if __name__ == "__main__":
-    analyzer = StockAnalyzer()
-    
-    print("\n" + "="*70)
-    print("🧪 TESTING SEPARATE VECTOR STORES")
-    print("="*70)
-    
-    # Test analyzing a company
-    print("\nAnalyze a company? (y/n)")
-    if input().lower() == 'y':
-        ticker = input("Enter ticker: ").upper()
-        success = analyzer.analyze_company(ticker)
-        
-        if success:
-            # Test questions
-            while True:
-                q = input("\nAsk a question (or 'quit'): ")
-                if q.lower() == 'quit':
-                    break
+        try:
+            # Update LLM temperature
+            self.llm.temperature = temperature
+            
+            # Create query engine with filters
+            query_engine = self.index.as_query_engine(
+                similarity_top_k=5,
+                filters=metadata_filters,
+                response_mode="tree_summarize",
+                verbose=True
+            )
+            
+            # Execute query (embeddings and LLM calls tracked automatically)
+            logger.info("   🤔 Executing query...")
+            response = query_engine.query(question)
+            
+            # Extract sources
+            sources = []
+            if hasattr(response, 'source_nodes'):
+                for i, node in enumerate(response.source_nodes):
+                    metadata = node.metadata if hasattr(node, 'metadata') else {}
+                    node_id = getattr(node, 'node_id', 'unknown')
+                    chunk_num = node_id.split('-')[-1] if '-' in str(node_id) else 'N/A'
+                    
+                    sources.append({
+                        "index": i + 1,
+                        "text": node.text,  # Full text, not truncated
+                        "score": float(node.score) if hasattr(node, 'score') else None,
+                        "metadata": metadata,
+                        "company_name": metadata.get('company_name', 'Unknown'),
+                        "ticker": metadata.get('ticker', 'N/A'),
+                        "fiscal_year": metadata.get('fiscal_year', 'N/A'),
+                        "filing_date": metadata.get('filing_date', 'N/A'),
+                        "accession_number": metadata.get('accession_number', ''),
+                        "filing_url": metadata.get('filing_url', ''),
+                        "chunk_id": chunk_num
+                    })
                 
-                result = analyzer.ask(q)
-                if result:
-                    print(f"\n📝 ANSWER:\n{result['answer']}\n")
-                    print(f"📊 STATS:")
-                    print(f"  Citations: {result['num_citations']}")
-                    print(f"  Sources: {result['num_sources']}")
-                    print(f"  All from {ticker}: {'✅ Yes' if all(s['ticker'] == ticker for s in result['sources']) else '❌ No'}")
+                logger.info(f"   ✅ Found {len(sources)} relevant sources")
+            
+            result = {
+                "answer": str(response),
+                "sources": sources,
+                "filters_applied": filters_applied,
+                "num_sources": len(sources)
+            }
+            
+            logger.info(f"   ✅ Query complete\n")
+            
+            # Update observation with results
+            langfuse_context.update_current_observation(
+                output={"num_sources": len(sources)},
+                metadata={"success": True}
+            )
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"   ❌ RAG query failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # Mark as error in LangFuse
+            langfuse_context.update_current_observation(
+                level="ERROR",
+                output={"error": str(e)}
+            )
+            
+            return {
+                "answer": f"I encountered an error searching the documents: {str(e)}",
+                "sources": [],
+                "filters_applied": filters_applied,
+                "error": str(e)
+            }
